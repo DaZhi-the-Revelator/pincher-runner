@@ -1,0 +1,279 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      pincher_ref:
+        description: Pincher tag to build and release (e.g. v1.0.24)
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PINCHER_REF: ${{ github.event.inputs.pincher_ref }}
+  NODE_VERSION: '20'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-linux:
+    name: Build linux-x86_64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Checkout pincher
+        run: |
+          git clone --depth=1 --branch "$PINCHER_REF" \
+            "https://codeberg.org/DaZhi-the-Revelator/pincher.git" pincher
+
+      - name: Install dependencies
+        working-directory: pincher
+        run: npm install
+
+      - name: Build bundle
+        working-directory: pincher
+        run: npm run build
+
+      - name: Build SEA binary
+        working-directory: pincher
+        run: |
+          echo '{"main":"bundle.js","output":"sea-prep.blob"}' > sea-config.json
+          node --experimental-sea-config sea-config.json
+          mkdir -p dist
+          cp "$(node -e 'process.stdout.write(process.execPath)')" dist/pincher
+          npx postject dist/pincher NODE_SEA_BLOB sea-prep.blob \
+            --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+
+      - name: Verify binary
+        working-directory: pincher
+        run: ./dist/pincher --version
+
+      - name: Stage archive
+        working-directory: pincher
+        run: |
+          mkdir -p staging
+          cp dist/pincher staging/
+          cp README.md LICENSE staging/
+          tar -czf ../pincher-linux-x86_64.tar.gz -C staging .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux-x86_64
+          path: pincher-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Build windows-x86_64
+    runs-on: windows-latest
+
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Checkout pincher
+        run: |
+          git clone --depth=1 --branch "$env:PINCHER_REF" `
+            "https://codeberg.org/DaZhi-the-Revelator/pincher.git" pincher
+          cd pincher
+
+      - name: Install dependencies
+        working-directory: pincher
+        run: npm install
+
+      - name: Build bundle
+        working-directory: pincher
+        run: npm run build
+
+      - name: Build SEA binary
+        working-directory: pincher
+        run: |
+          '{"main":"bundle.js","output":"sea-prep.blob"}' | Out-File -Encoding utf8 sea-config.json
+          node --experimental-sea-config sea-config.json
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $nodePath = node -e "process.stdout.write(process.execPath)"
+          Copy-Item $nodePath dist\pincher.exe
+          npx postject dist\pincher.exe NODE_SEA_BLOB sea-prep.blob `
+            --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+
+      - name: Verify binary
+        working-directory: pincher
+        run: .\dist\pincher.exe --version
+
+      - name: Stage archive
+        working-directory: pincher
+        run: |
+          mkdir staging
+          copy dist\pincher.exe staging\
+          copy README.md staging\
+          copy LICENSE staging\
+          Compress-Archive -Path staging\* -DestinationPath ..\pincher-windows-x86_64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-x86_64
+          path: pincher-windows-x86_64.zip
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-latest
+          - arch: x86_64
+            runner: macos-15-intel
+      fail-fast: false
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Checkout pincher
+        run: |
+          git clone --depth=1 --branch "$PINCHER_REF" \
+            "https://codeberg.org/DaZhi-the-Revelator/pincher.git" pincher
+
+      - name: Install dependencies
+        working-directory: pincher
+        run: npm install
+
+      - name: Build bundle
+        working-directory: pincher
+        run: npm run build
+
+      - name: Build SEA binary
+        working-directory: pincher
+        run: |
+          echo '{"main":"bundle.js","output":"sea-prep.blob"}' > sea-config.json
+          node --experimental-sea-config sea-config.json
+          mkdir -p dist
+          cp "$(node -e 'process.stdout.write(process.execPath)')" dist/pincher
+          codesign --remove-signature dist/pincher
+          npx postject dist/pincher NODE_SEA_BLOB sea-prep.blob \
+            --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 \
+            --macho-segment-name NODE_SEA
+          codesign --sign - dist/pincher
+
+      - name: Verify binary
+        working-directory: pincher
+        run: |
+          file dist/pincher
+          dist/pincher --version
+
+      - name: Stage archive
+        working-directory: pincher
+        run: |
+          mkdir -p staging
+          cp dist/pincher staging/
+          cp README.md LICENSE staging/
+          tar -czf ../pincher-macos-${{ matrix.arch }}.tar.gz -C staging .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-${{ matrix.arch }}
+          path: pincher-macos-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Create Codeberg Release
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout pincher CHANGELOG
+        run: |
+          git clone --depth=1 --branch "$PINCHER_REF" \
+            "https://codeberg.org/DaZhi-the-Revelator/pincher.git" pincher
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
+            -exec cp {} release-assets/ \;
+          ls -lh release-assets/
+
+      - name: Extract changelog body
+        id: changelog
+        run: |
+          TAG="${{ github.event.inputs.pincher_ref }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          python3 - "${TAG}" <<'PYEOF' > body.txt
+          import sys, re, pathlib
+
+          tag = sys.argv[1]
+          text = pathlib.Path("pincher/CHANGELOG.md").read_text(encoding="utf-8")
+
+          pattern = rf"(?m)^## \[{re.escape(tag)}\].*?\n(.*?)(?=^## \[|\Z)"
+          m = re.search(pattern, text, re.DOTALL)
+
+          print(m.group(1).strip() if m else "")
+          PYEOF
+
+          echo "Body extracted: $(wc -c < body.txt) bytes"
+
+      - name: Create Codeberg release and upload assets
+        env:
+          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+          TAG: ${{ steps.changelog.outputs.tag }}
+          API: https://codeberg.org/api/v1
+          REPO: DaZhi-the-Revelator/pincher
+        run: |
+          set -e
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: token ${CODEBERG_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary "$(jq -n \
+              --arg tag "${TAG}" \
+              --rawfile body body.txt \
+              '{tag_name:$tag,name:$tag,body:$body,draft:false,prerelease:false}')" \
+            "${API}/repos/${REPO}/releases")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          echo "HTTP status: ${HTTP_CODE}"
+          echo "Response body: ${BODY}"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Error: Codeberg API returned HTTP ${HTTP_CODE}"
+            exit 1
+          fi
+
+          RELEASE_ID=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+          echo "Release ID: ${RELEASE_ID}"
+
+          for asset in release-assets/*; do
+            name=$(basename "$asset")
+            echo "Uploading ${name}..."
+            curl -sf -X POST \
+              -H "Authorization: token ${CODEBERG_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${asset}" \
+              "${API}/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${name}"
+          done
+
+          echo "Release ${TAG} published to Codeberg."
